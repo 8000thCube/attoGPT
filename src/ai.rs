@@ -3,13 +3,13 @@ use std::{
 	io::{Error as IOError,Read as IORead,Write as IOWrite},
 	time::{SystemTime,UNIX_EPOCH}
 };
-#[derive(Clone,Debug)]
+#[derive(Clone,Debug)]//TODO fix the fact that the code was written with a slight misunderstanding of vocabulary usage with 'block' and 'layer' 
 pub struct AIBlock{buffer:Vec<f32>,bufferderivatives:Vec<f32>,bufferlen:usize,bufferoffset:usize,derivativesoffset:usize,pub parameters:Vec<f32>,parametersderivatives:Vec<f32>,parametersposition:usize,pub seed:u128}
 #[derive(Clone,Debug)]
 pub struct GPT{block:AIBlock,contextdimension:usize,headcount:usize,headdimension:usize,transformerlayers:usize,uniquetokencount:usize}
 #[derive(Clone,Debug)]
 pub struct GeluMultilayerPerceptron{block:AIBlock,inputdimension:usize,intermediatedimension:usize,intermediatelayers:usize,outputdimension:usize}
-#[derive(Clone,Debug)]//TODO think of a better name for this structure since this acronym is meaningless. Perhaps something about testing because testing attention since that is the entire point of writing this
+#[derive(Clone,Debug)]//TODO think of a better name for this structure since this acronym is meaningless. Perhaps something about testing because testing attention since that is the entire point of writing this. Alternatively it could be said to mean 'Single Layer Transformer'
 pub struct SLT{block:AIBlock,pub contextdimension:usize,pub embeddingdimension:usize,pub heads:usize,pub intermediatedimension:usize,pub outputdimension:usize}
 fn allocate_data<'a>(compact:bool,data:&'a mut Vec<f32>,datalen:usize,newlen:usize,offset:&mut usize)->(&'a mut [f32],&'a mut [f32]){
 	let datastart=*offset;
@@ -29,7 +29,7 @@ fn allocate_data<'a>(compact:bool,data:&'a mut Vec<f32>,datalen:usize,newlen:usi
 	let start=*position;
 	let stop=len+start;
 	*position=stop;
-	if parameters.len()<stop{parameters.resize_with(stop,||rfloat(seed));}
+	if parameters.len()<stop{parameters.resize_with(stop,||rfloat(seed))}
 	&parameters[start..stop]
 }fn reverse_data<'a>(data:&'a mut Vec<f32>,datalen:usize,offset:&mut usize,oldlen:usize)->(&'a mut [f32],&'a mut [f32]){
 	let datastart=*offset;
@@ -46,6 +46,18 @@ fn allocate_data<'a>(compact:bool,data:&'a mut Vec<f32>,datalen:usize,newlen:usi
 }impl AIBlock{
 	fn from_existing_data(buffer:Vec<f32>,bufferderivatives:Vec<f32>,bufferlen:usize,bufferoffset:usize,derivativesoffset:usize,parameters:Vec<f32>,parametersderivatives:Vec<f32>,parametersposition:usize,seed:u128)->Self{
 		Self{buffer,bufferderivatives,bufferlen,bufferoffset,derivativesoffset,parameters,parametersderivatives,parametersposition,seed}
+	}pub fn adamw(&mut self,b1:f32,b2:f32,rate:f32,step:usize,weightdecay:f32){
+		const EPSILON:f32=1.0E-16;
+		let step=(step.clamp(0,i32::MAX as usize)as i32).saturating_add(1);
+		let (b1h,b2h,derivatives,parameters,weightpersistence)=((1.0-b1.powi(step)).recip(),(1.0-b2.powi(step)).recip(),&mut self.parametersderivatives,&mut self.parameters,1.0-rate*weightdecay);
+		let pl=parameters.len();
+		if derivatives.len()<pl*3{derivatives.resize(pl*3,0.0)}
+		let (derivatives,mv)=derivatives.split_at_mut(pl);
+		let (m,v)=mv.split_at_mut(pl);
+		derivatives.iter_mut().zip(m).zip(v).zip(parameters).for_each(|(((d,m),v),x)|{
+			(*d,*m,*v)=(0.0,b1**m+(b1-1.0)**d,b2**v+(1.0-b2)**d**d);
+			*x=weightpersistence**x-(*v+EPSILON).powf(-0.5)*b1h**m*rate;//TODO this method of avoiding a negative power of 0 is questionable. Similarly for the layer normalization An infinite value would propogate and destroy progress, but I'm not sure a factor of 100000000 is very good either. Pytorch's version of the function, whose documentation I used for reference, does something similar, but perhaps some alternative such as clamping to a range should be tested.
+		});
 	}pub fn allocate(&mut self,compact:bool,differentiate:bool,layerlen:usize,parameterslen:usize,templen:usize)->(&[f32],&mut [f32],&mut [f32],&[f32],&[f32],&mut [f32],&mut [f32],&mut [f32]){//TODO unbackwards the buffer derivatives in noncompact differentiate mode
 		let (buffer,bufferderivatives,bufferlen,bufferoffset,derivativesoffset,parameters,parametersderivatives,parametersposition,seed)=(&mut self.buffer,&mut self.bufferderivatives,self.bufferlen,&mut self.bufferoffset,&mut self.derivativesoffset,&mut self.parameters,&mut self.parametersderivatives,&mut self.parametersposition,&mut self.seed);
 		self.bufferlen=layerlen;
@@ -59,11 +71,6 @@ fn allocate_data<'a>(compact:bool,data:&'a mut Vec<f32>,datalen:usize,newlen:usi
 			self.bufferoffset+=templen;
 			(input,inputderivatives,output,outputderivatives,parameters,parametersderivatives,temp,tempderivatives)
 		}
-	}pub fn adjust(&mut self,persistence:f32,step:f32){
-		self.parameters.iter_mut().zip(&mut self.parametersderivatives).for_each(|(x,dx)|{
-			*x+=*dx*step;
-			*dx*=persistence;
-		});
 	}pub fn affine_layer(&mut self,compact:bool,differentiate:bool,inputdimension:usize,outputdimension:usize){
 		let bufferlen=self.bufferlen;
 		let layerlen=if differentiate{bufferlen/outputdimension*inputdimension}else{bufferlen/inputdimension*outputdimension};
@@ -77,12 +84,7 @@ fn allocate_data<'a>(compact:bool,data:&'a mut Vec<f32>,datalen:usize,newlen:usi
 	}pub fn attention_layer(&mut self,compact:bool,contextdimension:usize,differentiate:bool,headcount:usize,headdimension:usize){//TODO make this better written compact version and dont necessarily allocate entire context requirement for compact inference
 		use std::ops::Range;
 		fn make_range(len:usize,start:usize)->Range<usize>{start..len+start}
-		fn two_subslices(r0:Range<usize>,r1:Range<usize>,slice:&mut [f32])->(&mut [f32],&mut [f32]){
-			fn make_subslices(higher:Range<usize>,lower:Range<usize>,slice:&mut [f32])->(&mut [f32],&mut [f32]){
-				let (a,b)=slice.split_at_mut(higher.start);
-				(&mut a[lower.start..lower.end],&mut b[..higher.len()])
-			}if r0.start>=r1.end{make_subslices(r0,r1,slice)}else{make_subslices(r1,r0,slice)}
-		}let (attention_volume,sharpness)=(|n:usize|headcount*(n+1)*n/2,(headdimension as f32).powf(-0.5));
+		let (attention_volume,sharpness)=(|n:usize|headcount*(n+1)*n/2,(headdimension as f32).powf(-0.5));
 		let (attention_range,kqv_range)=(|contextdimension:usize,n:usize|make_range(headcount*(n+1),attention_volume(n)),|head:usize,n:usize|make_range(headdimension,head*headdimension+headcount*headdimension*n));
 
 		let (attentionarea,embeddingarea,len)=((contextdimension+1)*contextdimension/2,headcount*headdimension,self.bufferlen);
@@ -109,7 +111,7 @@ fn allocate_data<'a>(compact:bool,data:&'a mut Vec<f32>,datalen:usize,newlen:usi
 					let (attention,attentionderivatives)=(&attention[attentionrange.clone()],&mut attentionderivatives[attentionrange.clone()]);
 					attention.chunks_exact(attentiondimension).enumerate().zip(attentionderivatives.chunks_exact_mut(attentiondimension)).zip(summaryderivatives.chunks_exact(headdimension)).for_each(|(((h,attention),attentionderivatives),summaryvaluederivatives)|{
 						let queryrange=kqv_range(h,n);
-						let query=&queries[queryrange.clone()];
+						let (query,queryderivatives)=(&queries[queryrange.clone()],&mut queriesderivatives[queryrange.clone()]);
 						let sum=attention.iter().enumerate().zip(&mut *attentionderivatives).map(|((v,&a),da)|{
 							let valuerange=kqv_range(h,v);
 							let (value,valuederivatives)=(&values[valuerange.clone()],&mut valuesderivatives[valuerange.clone()]);
@@ -121,7 +123,7 @@ fn allocate_data<'a>(compact:bool,data:&'a mut Vec<f32>,datalen:usize,newlen:usi
 						}).sum::<f32>();
 						attention.iter().enumerate().zip(&*attentionderivatives).for_each(|((k,a),da)|{
 							let keyrange=kqv_range(h,k);
-							let (key,keyderivatives,query,queryderivatives)=(&keys[keyrange.clone()],&mut keysderivatives[keyrange.clone()],&queries[keyrange.clone()],&mut queriesderivatives[keyrange.clone()]);
+							let (key,keyderivatives)=(&keys[keyrange.clone()],&mut keysderivatives[keyrange.clone()]);
 							rd_dot(key,query,keyderivatives,queryderivatives,(da-sum)*a);
 						});
 					});
@@ -240,7 +242,7 @@ fn allocate_data<'a>(compact:bool,data:&'a mut Vec<f32>,datalen:usize,newlen:usi
 		}else{compact},len/dimension,|data:&[f32]|{
 			let sum=data.iter().sum::<f32>();
 			let average=li*sum;
-			(average,(EPSILON+data.iter().map(|v|average-v).map(|v|v*v).sum::<f32>()*li).powf(-0.5))
+			(average,(data.iter().map(|v|average-v).map(|v|v*v).sum::<f32>()*li+EPSILON).powf(-0.5))
 		});
 		let (input,inputderivatives,output,outputderivatives,parameters,parametersderivatives,temp,_)=self.allocate(alloccompact,differentiate,len,dimension*2,if compactforward{0}else{arl*2});
 		if compactforward{
@@ -301,12 +303,32 @@ fn allocate_data<'a>(compact:bool,data:&'a mut Vec<f32>,datalen:usize,newlen:usi
 			gelu_layer(Some(intermediatea),intermediateb);
 			trans_mat_mul(ACC|BIAS,intermediateb,intermediatedimension,outputparameters,output);
 		}
-	}pub fn reset(&mut self){(self.bufferlen,self.bufferoffset,self.parametersposition)=(0,0,0)}
-	pub fn soft_choose(&mut self,lastn:usize,sharpness:f32)->usize{
+	}pub fn reset(&mut self){
+		(self.bufferlen,self.bufferoffset,self.parametersposition)=(0,0,0);
+		//self.parametersderivatives.clear();//TODO this should reset parameter derivatives since those aren't implicitly reset by repositioning, but some stuff will need to be refactored to not rely on it not doing so
+	}pub fn rprop(&mut self,hm:f32,hp:f32){
+		let (parameters,parametersderivatives)=(&mut self.parameters,&mut self.parametersderivatives);
+		let parameterslen=parameters.len();
+		parametersderivatives.resize(parameterslen*2,0.0);
+		let (derivatives,directiondata)=parametersderivatives.split_at_mut(parameterslen);
+		derivatives.iter_mut().zip(directiondata).zip(parameters).for_each(|((d,directiondata),x)|{
+			let (derivativesign,priorderivativesign)=(d.is_sign_negative(),directiondata.is_sign_negative());
+			*directiondata*=if derivativesign==priorderivativesign{hp}else{-hm};
+			if directiondata.is_nan()||*directiondata==0.0{*directiondata=*d}
+			*d=0.0;
+			*directiondata=directiondata.clamp(-1.0,1.0);
+			*x+=*directiondata;
+		});
+	}pub fn soft_choose(&mut self,lastn:usize,sharpness:f32)->usize{
 		let (buffer,bufferlen,bufferoffset,seed)=(&self.buffer,self.bufferlen,self.bufferoffset,&mut self.seed);	
 		soft_choose(&buffer[(bufferlen+bufferoffset).saturating_sub(lastn)..bufferlen+bufferoffset],seed,sharpness)
 	}pub fn squared_error(&self,target:&[f32])->f32{squared_error(self.output(),target)}
-	pub fn transformer_layer(&mut self,compact:bool,contextdimension:usize,differentiate:bool,headcount:usize,headdimension:usize){
+	pub fn sgd(&mut self,persistence:f32,step:f32){
+		self.parameters.iter_mut().zip(&mut self.parametersderivatives).for_each(|(x,dx)|{
+			*x+=*dx*step;
+			*dx*=persistence;
+		});
+	}pub fn transformer_layer(&mut self,compact:bool,contextdimension:usize,differentiate:bool,headcount:usize,headdimension:usize){
 		let embeddingarea=headcount*headdimension;
 		let projectionarea=embeddingarea*4;
 		if differentiate{
@@ -339,7 +361,7 @@ fn allocate_data<'a>(compact:bool,data:&'a mut Vec<f32>,datalen:usize,newlen:usi
 		block.gpt(true,contextdimension,false,headcount,headdimension,0,transformerlayers,&examples[..el-1],uniquetokencount);
 		block.entropic_one_hot_error(&examples[1..],uniquetokencount,1.0)
 	}pub fn from_parameters(contextdimension:usize,headcount:usize,headdimension:usize,transformerlayers:usize,uniquetokencount:usize,parameters:Vec<f32>)->Self{Self::from_existing_data(parameters.into(),contextdimension,headcount,headdimension,transformerlayers,uniquetokencount)}
-	pub fn generate_u8(&mut self,filldimension:&mut usize,sharpness:f32,tokens:&mut [u8]){//TODO be consistent about tokenization generics. get a better terminator system. also maybe this should have a sliding window or increase context dimension if filldimension gets too large. also compact is mainly to save memory on derivatives and there should be a non compact process option that reserves space so this isn't cubic
+	pub fn generate_u8(&mut self,filldimension:&mut usize,sharpness:f32,tokens:&mut [u8]){//TODO be consistent about tokenization generics. get a better terminator system. also maybe this should have a sliding window or increase context dimension if filldimension gets too large. also there should be a not fully compact process option that reserves space on the attention layer so this isn't cubic
 		let limit=tokens.len();
 		while *filldimension<limit{
 			let (past,future)=tokens.split_at_mut(*filldimension);
@@ -351,26 +373,37 @@ fn allocate_data<'a>(compact:bool,data:&'a mut Vec<f32>,datalen:usize,newlen:usi
 		let (embeddingarea,parameters,priorcontextdimension)=(self.headcount*self.headdimension,&mut self.block.parameters,self.contextdimension);
 		let (positionencodinglen,priorpositionencodinglen,priorparameterslen)=(contextdimension*embeddingarea,embeddingarea*priorcontextdimension,parameters.len());
 		let parameterslen=priorparameterslen-priorpositionencodinglen+positionencodinglen;
-		if contextdimension<priorcontextdimension{
-			parameters.copy_within(priorpositionencodinglen..priorparameterslen,positionencodinglen);
-			parameters.truncate(parameterslen);
-		}else if contextdimension>priorcontextdimension{
-			parameters.resize(parameterslen,0.0);
-			parameters.copy_within(priorpositionencodinglen..priorparameterslen,positionencodinglen);
-			parameters.iter_mut().zip(position_encodings(embeddingarea)).take(positionencodinglen).skip(priorpositionencodinglen).for_each(|(p,e)|*p=e);
-		}self.contextdimension=contextdimension;
+		if contextdimension>priorcontextdimension{parameters.resize(parameterslen,0.0)}
+		parameters.copy_within(priorpositionencodinglen..priorparameterslen,positionencodinglen);
+		parameters.iter_mut().zip(position_encodings(embeddingarea)).take(positionencodinglen).skip(priorpositionencodinglen).for_each(|(p,e)|*p=e);
+		parameters.truncate(parameterslen);
+		self.contextdimension=contextdimension;
 	}pub fn sample_string(&mut self)->String{
 		let mut result=vec![32;self.contextdimension];
 		self.generate_u8(&mut 0,1.0,&mut result);
 		String::from_utf8_lossy(&result).to_string()
 	}pub fn seed(&mut self)->&mut u128{&mut self.block.seed}
 	pub fn train<T:Copy+Into<usize>>(&mut self,examples:&[T],persistence:f32,step:f32){
-		let (block,contextdimension,el,headcount,headdimension,transformerlayers,uniquetokencount)=(&mut self.block,self.contextdimension,examples.len()-1,self.headcount,self.headdimension,self.transformerlayers,self.uniquetokencount);
+		let (block,contextdimension,elm1,headcount,headdimension,transformerlayers,uniquetokencount)=(&mut self.block,self.contextdimension,examples.len()-1,self.headcount,self.headdimension,self.transformerlayers,self.uniquetokencount);
 		block.reset();
-		block.gpt(false,contextdimension,false,headcount,headdimension,0,transformerlayers,&examples[..el-1],uniquetokencount);
+		block.gpt(false,contextdimension,false,headcount,headdimension,0,transformerlayers,&examples[..elm1],uniquetokencount);
 		block.differentiate_entropic_one_hot_error(&examples[1..],-1.0,uniquetokencount,1.0);
-		block.gpt(true,contextdimension,true,headcount,headdimension,0,transformerlayers,&examples[..el-1],uniquetokencount);
-		block.adjust(persistence,step);
+		block.gpt(true,contextdimension,true,headcount,headdimension,0,transformerlayers,&examples[..elm1],uniquetokencount);
+		block.sgd(persistence,step);
+	}pub fn train_adamw<T:Copy+Into<usize>>(&mut self,b1:f32,b2:f32,examples:&[T],iteration:usize,rate:f32,weightdecay:f32){
+		let (block,contextdimension,elm1,headcount,headdimension,transformerlayers,uniquetokencount)=(&mut self.block,self.contextdimension,examples.len()-1,self.headcount,self.headdimension,self.transformerlayers,self.uniquetokencount);
+		block.reset();
+		block.gpt(false,contextdimension,false,headcount,headdimension,0,transformerlayers,&examples[..elm1],uniquetokencount);
+		block.differentiate_entropic_one_hot_error(&examples[1..],-1.0,uniquetokencount,1.0);
+		block.gpt(true,contextdimension,true,headcount,headdimension,0,transformerlayers,&examples[..elm1],uniquetokencount);
+		block.adamw(b1,b2,rate,iteration,weightdecay);
+	}pub fn train_rprop<T:Copy+Into<usize>>(&mut self,examples:&[T],hm:f32,hp:f32){
+		let (block,contextdimension,elm1,headcount,headdimension,transformerlayers,uniquetokencount)=(&mut self.block,self.contextdimension,examples.len()-1,self.headcount,self.headdimension,self.transformerlayers,self.uniquetokencount);
+		block.reset();
+		block.gpt(false,contextdimension,false,headcount,headdimension,0,transformerlayers,&examples[..elm1],uniquetokencount);
+		block.differentiate_entropic_one_hot_error(&examples[1..],-1.0,uniquetokencount,1.0);
+		block.gpt(true,contextdimension,true,headcount,headdimension,0,transformerlayers,&examples[..elm1],uniquetokencount);
+		block.rprop(hm,hp);
 	}
 }impl GeluMultilayerPerceptron{
 	fn from_existing_data(block:AIBlock,inputdimension:usize,intermediatedimension:usize,intermediatelayers:usize,outputdimension:usize)->Self{
@@ -384,6 +417,30 @@ fn allocate_data<'a>(compact:bool,data:&'a mut Vec<f32>,datalen:usize,newlen:usi
 		block.gelu_multilayer_perceptron(true,false,inputdimension,intermediatedimension,intermediatelayers,outputdimension);
 		block.output()
 	}pub fn train(&mut self,input:&[f32],iterations:usize,persistence:f32,step:f32,target:&[f32])->f32{
+		let (block,inputdimension,intermediatedimension,intermediatelayers,outputdimension)=(&mut self.block,self.inputdimension,self.intermediatedimension,self.intermediatelayers,self.outputdimension);
+		block.reset();
+		block.input(false,false,input);
+		(0..iterations).for_each(|_|{
+			block.gelu_multilayer_perceptron(false,false,inputdimension,intermediatedimension,intermediatelayers,outputdimension);
+			block.differentiate_squared_error(-1.0,target);
+			block.gelu_multilayer_perceptron(true,true,inputdimension,intermediatedimension,intermediatelayers,outputdimension);
+			block.sgd(persistence,step);
+		});
+		block.gelu_multilayer_perceptron(false,false,inputdimension,intermediatedimension,intermediatelayers,outputdimension);
+		block.squared_error(target)
+	}pub fn train_adamw(&mut self,b1:f32,b2:f32,input:&[f32],iterations:usize,rate:f32,target:&[f32],weightdecay:f32)->f32{
+		let (block,inputdimension,intermediatedimension,intermediatelayers,outputdimension)=(&mut self.block,self.inputdimension,self.intermediatedimension,self.intermediatelayers,self.outputdimension);
+		block.reset();
+		block.input(false,false,input);
+		(0..iterations).for_each(|step|{
+			block.gelu_multilayer_perceptron(false,false,inputdimension,intermediatedimension,intermediatelayers,outputdimension);
+			block.differentiate_squared_error(-1.0,target);
+			block.gelu_multilayer_perceptron(true,true,inputdimension,intermediatedimension,intermediatelayers,outputdimension);
+			block.adamw(b1,b2,rate,step,weightdecay);
+		});
+		block.gelu_multilayer_perceptron(false,false,inputdimension,intermediatedimension,intermediatelayers,outputdimension);
+		block.squared_error(target)
+	}pub fn train_rprop(&mut self,input:&[f32],hm:f32,hp:f32,iterations:usize,target:&[f32])->f32{
 		let (block,inputdimension,intermediatedimension,intermediatelayers,il,outputdimension)=(&mut self.block,self.inputdimension,self.intermediatedimension,self.intermediatelayers,input.len(),self.outputdimension);
 		block.reset();
 		block.input(false,false,input);
@@ -391,7 +448,7 @@ fn allocate_data<'a>(compact:bool,data:&'a mut Vec<f32>,datalen:usize,newlen:usi
 			block.gelu_multilayer_perceptron(false,false,inputdimension,intermediatedimension,intermediatelayers,outputdimension);
 			block.differentiate_squared_error(-1.0,target);
 			block.gelu_multilayer_perceptron(true,true,inputdimension,intermediatedimension,intermediatelayers,outputdimension);
-			block.adjust(persistence,step);
+			block.rprop(hm,hp);
 		});
 		block.gelu_multilayer_perceptron(false,false,inputdimension,intermediatedimension,intermediatelayers,outputdimension);
 		block.squared_error(target)
@@ -422,7 +479,7 @@ fn allocate_data<'a>(compact:bool,data:&'a mut Vec<f32>,datalen:usize,newlen:usi
 			block.normalization_layer(true,true,heads*intermediatedimension);
 			block.transformer_layer(true,contextdimension,true,heads,intermediatedimension);
 			block.embed(true,contextdimension,true,heads*intermediatedimension,0,input,256);
-			block.adjust(persistence,step);
+			block.sgd(persistence,step);
 		});
 		block.embed(false,contextdimension,false,heads*intermediatedimension,0,input,256);
 		block.transformer_layer(false,contextdimension,false,heads,intermediatedimension);
@@ -453,20 +510,27 @@ fn allocate_data<'a>(compact:bool,data:&'a mut Vec<f32>,datalen:usize,newlen:usi
 		self.transformerlayers.write(writer)?;
 		self.uniquetokencount.write(writer)
 	}
-}pub const ACC:u8=1;
+}///mat mul flag to accumulate into the output rather than setting it
+pub const ACC:u8=1;
+///mat mul flag to add bias in the same operation
 pub const BIAS:u8=2;
+///dot product of two vectors represented by f32 slices
 pub fn dot(a:&[f32],b:&[f32])->f32{a.iter().zip(b).map(|(a,b)|a*b).sum()}
+///cross entropy in nats of a softmax of logits with a 'one hot' probability distribution. (a distribution where one value is 1 and the rest are 0). The input 'correct' gives the index of the 1.
 pub fn entropic_one_hot_error(correct:usize,logits:&[f32],sharpness:f32)->f32{
 	let lic=||logits.iter().copied();
 	let m=if sharpness<0.0{lic().fold(f32::INFINITY,f32::min)}else{lic().fold(f32::NEG_INFINITY,f32::max)};
 	let lnchances=||lic().map(|x|if m==x{0.0}else{(x-m)*sharpness});
 	let lnsum=lnchances().map(f32::exp).sum::<f32>().ln();
 	lnsum-lnchances().nth(correct).expect("correct bit is out of range")
-}pub fn gelu(x:f32)->f32{(((x*x*x*0.044715+x)*0.79788456).tanh()+1.0)*x*0.5}//TODO magic numbers
+}///approximation of the Gaussian Error Linear Unit. Apparently its a good activation function or something idk
+pub fn gelu(x:f32)->f32{(((x*x*x*0.044715+x)*0.79788456).tanh()+1.0)*x*0.5}//TODO magic numbers
+///apply gelu componentwise to a slice. Optionally, the input can be separate from the output (layer).
 pub fn gelu_layer(input:Option<&[f32]>,layer:&mut [f32]){
 	if let Some(input)=input{input.iter().zip(layer).for_each(|(&x,y)|*y=gelu(x))}
 	else{layer.iter_mut().for_each(|x|*x=gelu(*x))}
-}pub fn position_encodings(embeddingdimension:usize)->impl Iterator<Item=f32>{
+}///position encodings. TODO think of better doc comments for this and in general
+pub fn position_encodings(embeddingdimension:usize)->impl Iterator<Item=f32>{
 	let m=-2.0/(embeddingdimension as f32);
 	(0..).map(move|x|{
 		let y=x%embeddingdimension;
@@ -474,25 +538,31 @@ pub fn gelu_layer(input:Option<&[f32]>,layer:&mut [f32]){
 		let z=x*10000f32.powf((y/2)as f32*m);
 		if y&1==0{z.sin()}else{z.cos()}
 	})
-}pub fn rd_dot(a:&[f32],b:&[f32],da:&mut [f32],db:&mut [f32],dc:f32){
+}///accumulate the derivatives of loss over the dot product of two vectors, represented by slices. 
+pub fn rd_dot(a:&[f32],b:&[f32],da:&mut [f32],db:&mut [f32],dc:f32){
 	a.iter().zip(b).zip(da).zip(db).for_each(|(((a,b),da),db)|{
 		*da+=b*dc;
 		*db+=a*dc;
 	});
-}pub fn rd_gelu(x:f32)->f32{
+}///derivative of gelu. Should be named differently because it computes a slightly different concept from the other rd functions. dz/dx given x rather than dl/dx given dl/dz
+pub fn rd_gelu(x:f32)->f32{
 	let x2=x*x;
 	let t=(x2*x*0.044715+x)*0.79788456;//TODO magic numbers
 	let b=t.cosh().recip();
 	((x2*0.134145+1.0)*b*b*x*0.79788456+t.tanh()+1.0)*0.5
-}pub fn rd_gelu_layer(input:&[f32],inputderivatives:&mut [f32],layerderivatives:&[f32]){input.iter().zip(inputderivatives).zip(layerderivatives).for_each(|((&x,dx),dy)|*dx=dy*rd_gelu(x))}
-pub fn rd_entropic_one_hot_error(correct:usize,errorderivative:f32,logits:&[f32],logitsderivatives:&mut [f32],sharpness:f32){//TODO since we probably don't want to make logitsderivatives acc, performance could be improved without too much effort byt using logitsderivatives as scratch space rather than recomputing chances
+}///accumulate the derivatives of loss over the componentwise gelu of a slice
+pub fn rd_gelu_layer(input:&[f32],inputderivatives:&mut [f32],layerderivatives:&[f32]){input.iter().zip(inputderivatives).zip(layerderivatives).for_each(|((&x,dx),dy)|*dx=dy*rd_gelu(x))}
+///compute the derivatives of loss over the cross entropy of the softmax of logits with a 'one hot' distribution. does not accumulate
+pub fn rd_entropic_one_hot_error(correct:usize,errorderivative:f32,logits:&[f32],logitsderivatives:&mut [f32],sharpness:f32){//TODO If we don't want to make logitsderivatives acc, performance could be improved without too much effort byt using logitsderivatives as scratch space rather than recomputing chances
 	let lic=||logits.iter().copied();
 	let m=if sharpness<0.0{lic().fold(f32::INFINITY,f32::min)}else{lic().fold(f32::NEG_INFINITY,f32::max)};
 	let chances=||lic().map(|x|if m==x{1.0}else{((x-m)*sharpness).exp()});
 	let r=chances().sum::<f32>().recip()*errorderivative*sharpness;
 	chances().zip(&mut *logitsderivatives).for_each(|(chance,dl)|*dl=chance*r);
 	logitsderivatives[correct]-=errorderivative*sharpness;
-}pub fn rd_squared_error(errorderivative:f32,logits:&[f32],logitsderivatives:&mut [f32],target:&[f32]){logits.iter().zip(logitsderivatives).zip(target).for_each(|((l,d),t)|*d=(l-t)*errorderivative*2.0)}
+}///compute the derivatives of loss over the squared error of logits with a target logit distribution. does not accumulate
+pub fn rd_squared_error(errorderivative:f32,logits:&[f32],logitsderivatives:&mut [f32],target:&[f32]){logits.iter().zip(logitsderivatives).zip(target).for_each(|((l,d),t)|*d=(l-t)*errorderivative*2.0)}
+///accumulate the derivatives of loss with x and y given the derivatives of loss with the z=x(yT) computed by trans_mat_mul.
 pub fn rd_trans_mat_mul(dx:&mut [f32],dy:&mut [f32],dz:&[f32],flags:u8,x:&[f32],xdimension:usize,y:&[f32]){
 	let bias=BIAS&flags!=0;
 	let ydimension=bias as usize+xdimension;
@@ -501,18 +571,21 @@ pub fn rd_trans_mat_mul(dx:&mut [f32],dy:&mut [f32],dz:&[f32],flags:u8,x:&[f32],
 		if bias{dy[0]+=dz}
 		rd_dot(x,&y[bias as usize..],dx,&mut dy[bias as usize..],dz);
 	}));
-}pub fn rfloat(seed:&mut u128)->f32{
+}///pseudorandomly updates a 16 byte seed and returns a 4 byte float evenly distributed on [-1.0, 1.0)
+pub fn rfloat(seed:&mut u128)->f32{
 	update_seed(seed);
-	*seed as i32 as f32/0x7FFFFFFF as f32
-}pub fn rsize(bound:usize,seed:&mut u128)->usize{
+	*seed as i32 as f32/(0x80000000 as u32 as f32)
+}///pseudorandomly updates a 16 byte seed and returns a usize evenly distributed on [0, bound)
+pub fn rsize(bound:usize,seed:&mut u128)->usize{
 	let mask=bound.next_power_of_two()-1;
 	loop{
 		update_seed(seed);
 		let result=(*seed as usize)&mask;
 		if bound>result{break result}
 	}
-}pub fn rseed()->u128{SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()}
-pub fn soft_choose(logits:&[f32],seed:&mut u128,sharpness:f32)->usize{
+}///creates a 16 byte seed from the current time
+pub fn rseed()->u128{SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()}
+pub fn soft_choose(logits:&[f32],seed:&mut u128,sharpness:f32)->usize{//TODO could be faster with a temp slice or just mutable logits if we aren't reusing them
 	let lic=||logits.iter().copied();
 	let m=if sharpness<0.0{lic().fold(f32::INFINITY,f32::min)}else{lic().fold(f32::NEG_INFINITY,f32::max)};
 	let chances=||lic().map(|x|if m==x{1.0}else{((x-m)*sharpness).exp()});
