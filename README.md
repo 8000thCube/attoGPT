@@ -1,8 +1,9 @@
 # attoGPT
 
-- A more minimal implementation of GPT architecture than others I have seen.
+- A more minimal implementation of GPT's transformer architecture than others I have seen.
+- Has methods for AdamW, RProp, and SGD optimizers. AdamW seems to be the best for this use case.
 - No "tensors"
-- Probably not the best written code
+- Probably not the best written code. I'll clean it up a bit sometime.
 - Pure standard library Rust
-- Currently haven't gotten loss below 3 on the Shakespeare looking dataset I copied from somewhere I forgot. It remains to be seen whether I need a more sophisticated optimizer, to correct something in the implementation, or to train for longer.
+- Gets down to about 2.5 nats loss now after fixing a bug
 - I might add a tokenizer later rather than just having the thing predict bytes.
