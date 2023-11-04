@@ -5,5 +5,5 @@
 - No "tensors"
 - Probably not the best written code. I'll clean it up a bit sometime.
 - Pure standard library Rust
-- Gets down to about 2.5 nats (~3.6 bits) loss now after fixing a bug
+- Gets down to about 2.5 nats (~3.6 bits) loss now after fixing a bug. I will look for more I suppose.
 - I might add a tokenizer later rather than just having the thing predict bytes.
