@@ -28,9 +28,12 @@ impl <S:Save,Z:Save>Save for (S,Z){
 	}fn write<I:IOWrite>(&self,writer:&mut I)->Result<(),IOError>{
 		let bytes=self.as_bytes();
 		bytes.len().write(writer)?;
-		for x in bytes{x.write(writer)?}
-		Ok(())
+		writer.write_all(bytes)
 	}
+}impl Save for bool{
+	fn read<I:IORead>(reader:&mut I)->Result<Self,IOError>{
+		match u8::read(reader)?{0=>Ok(false),1=>Ok(true),_=>Err(IOError::from(IOErrorKind::InvalidData))}
+	}fn write<I:IOWrite>(&self,writer:&mut I)->Result<(),IOError>{u8::from(*self).write(writer)}
 }impl Save for char{
 	fn read<I:IORead>(reader:&mut I)->Result<Self,IOError>{
 		let code=u32::read(reader)?;
