@@ -584,7 +584,7 @@ pub fn soft_choose(logits:&[f32],seed:&mut u128,sharpness:f32)->usize{//TODO cou
 	let lic=||logits.iter().copied();
 	let m=if sharpness<0.0{lic().fold(f32::INFINITY,f32::min)}else{lic().fold(f32::NEG_INFINITY,f32::max)};
 	let chances=||lic().map(|x|if m==x{1.0}else{((x-m)*sharpness).exp()});
-	let mut choice=(rfloat(seed)*0.5+1.0)*chances().sum::<f32>();
+	let mut choice=(rfloat(seed)*0.5+0.5)*chances().sum::<f32>();
 	for (n,chance)in chances().enumerate(){
 		choice-=chance;
 		if choice<0.0{return n}
